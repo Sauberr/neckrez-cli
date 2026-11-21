@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""neckrez: command-line client for the Neckrez public API (https://neckrez.tech/docs).
+
+One file, Python 3.8+, standard library only.
+
+  neckrez login                      save an API key (create one at /dashboard/api-keys)
+  neckrez balance                    prepaid balance and recent transactions
+  neckrez plans [--type vps]         live plan catalogue (no key needed)
+  neckrez locations                  live locations (no key needed)
+  neckrez deploy NAME --plan ion --location AMS [--ssh-key] [--wait]
+  neckrez ls                         your servers
+  neckrez show|start|stop|reboot|swap-ip|rm SERVER
+  neckrez ssh SERVER [-- ssh args]
+  neckrez backups ls|create|restore|rm
+
+SERVER is an id, an id prefix or an exact name. Add --json to any command for
+machine-readable output. NECKREZ_API_KEY and NECKREZ_API_URL override the saved config.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import secrets
+import socket
+import ssl
+import stat
+import string
+import sys
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "0.1.2"
+DEFAULT_URL = "https://neckrez.tech"
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "neckrez", "config.json")
+
+
+PORT_WAIT = True  # --wait also waits for SSH/RDP; --no-port-wait turns that off
+
+
+class CliError(Exception):
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.code = code
+
+
+# ── config ───────────────────────────────────────────────────────────────────
+def load_config():
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    fd = os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG, stat.S_IRUSR | stat.S_IWUSR)
+
+
+def base_url():
+    return (os.environ.get("NECKREZ_API_URL") or load_config().get("url") or DEFAULT_URL).rstrip("/")
+
+
+def api_key():
+    key = os.environ.get("NECKREZ_API_KEY") or load_config().get("key")
+    if not key:
+        raise CliError("no API key: run `neckrez login` or set NECKREZ_API_KEY", 2)
+    return key
+
+
+# ── http ─────────────────────────────────────────────────────────────────────
+CA_BUNDLES = ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt")
+
+
+def tls_context():
+    """The default context. A python.org build on macOS ships with no root certificates, so when
+    none are loaded fall back to the system bundle. Verification is never turned off."""
+    ctx = ssl.create_default_context()
+    if not ctx.cert_store_stats().get("x509_ca"):
+        for path in CA_BUNDLES:
+            if os.path.exists(path):
+                ctx.load_verify_locations(path)
+                break
+    return ctx
+
+
+def request(method, path, body=None, auth=True, key=None):
+    """One API call. Retries on 429 with a growing delay; other errors raise CliError."""
+    headers = {"Accept": "application/json", "User-Agent": f"neckrez-cli/{VERSION}"}
+    if auth:
+        headers["Authorization"] = "Bearer " + (key or api_key())
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(base_url() + path, data=data, headers=headers, method=method)
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=60, context=tls_context()) as resp:
+                raw = resp.read().decode() or "{}"
+                return resp.status, json.loads(raw)
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode(errors="replace")
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                payload = {"detail": raw[:200]}
+            if e.code == 429 and attempt < 3:
+                time.sleep(2 ** (attempt + 1))
+                continue
+            if e.code == 207:  # bulk deploy where only some servers were created
+                return e.code, payload
+            raise CliError(explain(e.code, payload), 1)
+        except urllib.error.URLError as e:
+            raise CliError(f"cannot reach {base_url()}: {e.reason}", 1)
+    raise CliError("rate limited (429): wait a minute and try again", 1)
+
+
+def explain(status, payload):
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if isinstance(detail, list):  # FastAPI validation errors
+        detail = "; ".join(str(d.get("msg", d)) for d in detail)
+    detail = detail or payload
+    hints = {
+        401: "the API key is missing, expired or revoked: run `neckrez login`",
+        402: "the balance does not cover this: top up at /dashboard/billing",
+        403: "forbidden: a read-only key cannot change anything",
+        404: "not found",
+    }
+    hint = hints.get(status)
+    return f"{status}: {detail}" + (f" ({hint})" if hint and str(detail) != hint else "")
+
+
+def get(path, **kw):
+    return request("GET", path, **kw)[1]
+
+
+# ── output ───────────────────────────────────────────────────────────────────
+def out_json(obj):
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
+
+
+def table(rows, header):
+    rows = [[str(c) for c in r] for r in rows]
+    widths = [max(len(header[i]), *(len(r[i]) for r in rows)) if rows else len(header[i]) for i in range(len(header))]
+    line = lambda r: "  ".join(c.ljust(widths[i]) for i, c in enumerate(r)).rstrip()  # noqa: E731
+    print(line(header))
+    for r in rows:
+        print(line(r))
+
+
+def money(v):
+    try:
+        return f"${float(v):.2f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def server_row(s):
+    p, loc = s.get("plan", {}), s.get("location", {})
+    return [s["id"][:8], s["name"], s.get("status", ""), s.get("ip") or "-", p.get("id", ""),
+            loc.get("code", ""), s.get("provider", ""), f"${p.get('price_hour', 0):.4f}/h"]
+
+
+SERVER_HEADER = ["ID", "NAME", "STATUS", "IP", "PLAN", "LOC", "PROVIDER", "PRICE"]
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+def find_server(ref):
+    servers = get("/api/v1/servers")["servers"]
+    exact = [s for s in servers if s["id"] == ref or s["name"] == ref]
+    hits = exact or [s for s in servers if s["id"].startswith(ref)]
+    if not hits:
+        raise CliError(f"no server matches {ref!r}", 1)
+    if len(hits) > 1:
+        raise CliError(f"{ref!r} matches {len(hits)} servers, use more of the id: " + ", ".join(s["id"][:8] for s in hits), 1)
+    return hits[0]
+
+
+def wait_port(server, deadline, quiet):
+    """After "running" the OS is still booting: wait until SSH (RDP on Windows) accepts connections.
+    Never an error: a server that is up but slow to open its port is only reported."""
+    port = 3389 if (server.get("os") or {}).get("name", "").lower() == "windows" else 22
+    if not quiet:
+        print(f"  waiting for port {port} on {server['ip']}", file=sys.stderr)
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((server["ip"], port), timeout=3):
+                return True
+        except OSError:
+            time.sleep(3)
+    print(f"neckrez: {server['name']} is running but port {port} did not open in time", file=sys.stderr)
+    return False
+
+
+def wait_running(server_id, timeout, quiet):
+    """Poll about every 5 seconds until the server is running and its SSH (or RDP) port is open."""
+    deadline = time.time() + timeout
+    last = ""
+    while True:
+        s = get(f"/api/v1/servers/{server_id}")
+        if s.get("status") != last and not quiet:
+            print(f"  status: {s.get('status')}", file=sys.stderr)
+            last = s.get("status")
+        if s.get("status") == "running" and s.get("ip"):
+            if PORT_WAIT:
+                wait_port(s, deadline, quiet)
+            return s
+        if s.get("status") in ("suspended", "error", "failed"):
+            raise CliError(f"server ended up {s.get('status')}", 1)
+        if time.time() > deadline:
+            raise CliError(f"still {s.get('status')} after {timeout}s: check `neckrez show {server_id[:8]}`", 1)
+        time.sleep(5)
+
+
+def gen_password():
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(24))
+
+
+def read_ssh_key(arg):
+    """--ssh-key with no value uses the first default public key; a value is a file or a literal key line."""
+    if arg == "auto":
+        for name in ("id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"):
+            path = os.path.expanduser(os.path.join("~/.ssh", name))
+            if os.path.exists(path):
+                arg = path
+                break
+        else:
+            raise CliError("no public key in ~/.ssh: pass --ssh-key FILE or the key line itself", 1)
+    if os.path.exists(os.path.expanduser(arg)):
+        with open(os.path.expanduser(arg), encoding="utf-8") as f:
+            return f.read().strip()
+    return arg.strip()
+
+
+def resolve_os_version(provider, os_id, wanted):
+    """Match --os-version loosely ("24.04") against the catalogue's exact version strings."""
+    if not wanted:
+        return ""
+    meta = get("/api/meta", auth=False)
+    for image in meta.get("os_images", []):
+        if image["id"] == os_id and image["provider"] == provider:
+            for v in image["versions"]:
+                if v == wanted:
+                    return v
+            for v in image["versions"]:
+                if wanted.lower() in v.lower():
+                    return v
+    raise CliError(f"no {os_id} version matching {wanted!r} on {provider}; see `neckrez os {os_id} --provider {provider}`", 1)
+
+
+# ── commands ─────────────────────────────────────────────────────────────────
+def cmd_login(a):
+    key = a.key or os.environ.get("NECKREZ_API_KEY") or getpass.getpass("API key (nek_...): ").strip()
+    if not key.startswith("nek_"):
+        raise CliError("an API key starts with nek_; create one at /dashboard/api-keys", 2)
+    cfg = load_config()
+    if a.url:
+        cfg["url"] = a.url.rstrip("/")
+        os.environ["NECKREZ_API_URL"] = cfg["url"]  # verify the key against the server being saved
+    bal = get("/api/v1/billing", key=key)  # a wrong key fails here, before anything is saved
+    cfg["key"] = key
+    save_config(cfg)
+    print(f"saved to {CONFIG}; balance {money(bal['balance'])}")
+
+
+def cmd_logout(a):
+    cfg = load_config()
+    cfg.pop("key", None)
+    save_config(cfg)
+    print("key removed")
+
+
+def cmd_balance(a):
+    bal = get("/api/v1/billing")
+    if a.json:
+        return out_json(bal)
+    print(f"balance: {money(bal['balance'])}")
+    txs = bal.get("transactions", [])[:10]
+    if txs:
+        print()
+        table([[time.strftime("%Y-%m-%d %H:%M", time.localtime(t.get("created_at", 0))), t.get("kind", ""),
+                t.get("amount", ""), t.get("description") or ""] for t in txs],
+              ["WHEN", "TYPE", "AMOUNT", "NOTE"])
+
+
+def cmd_plans(a):
+    plans = get("/api/meta", auth=False)["plans"]
+    plans = [p for p in plans if (not a.provider or p.get("provider") == a.provider)
+             and (not a.type or (p.get("product") or "vps") == a.type)
+             and (not a.max_price or p["price_month"] <= a.max_price)
+             and (not a.available or p.get("available", True))]
+    plans.sort(key=lambda p: (p.get("provider", ""), p["price_month"]))
+    if a.json:
+        return out_json(plans)
+    table([[p.get("provider", ""), p["id"], p.get("product") or "vps", p["vcpu"], f"{p['ram_gb']:g}", p["disk_gb"],
+            f"${p['price_month']:g}", f"${p['price_hour']:.4f}", "yes" if p.get("available", True) else "no"] for p in plans],
+          ["PROVIDER", "PLAN", "TYPE", "VCPU", "RAM GB", "DISK GB", "MONTH", "HOUR", "AVAILABLE"])
+
+
+def cmd_locations(a):
+    locs = [l for l in get("/api/meta", auth=False)["locations"] if not a.provider or l["provider"] == a.provider]
+    if a.json:
+        return out_json(locs)
+    table([[l["provider"], l["code"], l["city"], l["country"]] for l in locs], ["PROVIDER", "CODE", "CITY", "COUNTRY"])
+
+
+def cmd_os(a):
+    images = [i for i in get("/api/meta", auth=False)["os_images"]
+              if (not a.provider or i["provider"] == a.provider) and (not a.name or i["id"] == a.name)]
+    if a.json:
+        return out_json(images)
+    table([[i["provider"], i["id"], ", ".join(i["versions"])] for i in images], ["PROVIDER", "OS", "VERSIONS"])
+
+
+def cmd_ls(a):
+    servers = get("/api/v1/servers")["servers"]
+    if a.json:
+        return out_json(servers)
+    if not servers:
+        print("no servers")
+        return
+    table([server_row(s) for s in servers], SERVER_HEADER)
+
+
+def cmd_show(a):
+    s = find_server(a.server)
+    out_json(s) if a.json else print(json.dumps(s, indent=2, ensure_ascii=False))
+
+
+def cmd_deploy(a):
+    body = {"name": a.name, "plan_id": a.plan, "location_code": a.location, "provider": a.provider,
+            "os_id": a.os, "os_version": resolve_os_version(a.provider, a.os, a.os_version), "app_id": a.app or ""}
+    if a.ssh_key:
+        body["ssh_key"] = read_ssh_key(a.ssh_key)
+    password = a.password
+    if not password and not body.get("ssh_key"):
+        password = gen_password()
+        generated = True
+    else:
+        generated = False
+    if password:
+        body["root_password"] = password
+    if a.backups:
+        body["addon_auto_backups"] = True
+    if a.ddos:
+        body["addon_ddos"] = True
+    if a.cloud_init:
+        with open(os.path.expanduser(a.cloud_init), encoding="utf-8") as f:
+            body["cloud_init"] = f.read()
+
+    if a.count > 1:
+        status, res = request("POST", "/api/v1/servers/bulk", {"count": a.count, "template": body})
+        created = res.get("created", [])
+        for f in res.get("failed", []):
+            print(f"failed: {f.get('name')}: {f.get('error')}", file=sys.stderr)
+        if a.wait:
+            created = [wait_running(s["id"], a.timeout, a.json) for s in created]
+        if a.json:
+            out_json({"created": created, "failed": res.get("failed", [])})
+        else:
+            table([server_row(s) for s in created], SERVER_HEADER)
+            if generated and created:
+                print(f"\nroot password (all {len(created)} servers, shown once): {password}")
+        if res.get("failed"):
+            raise CliError(f"{len(res['failed'])} of {a.count} servers failed", 3)
+        return
+
+    _, server = request("POST", "/api/v1/servers", body)
+    if a.wait:
+        server = wait_running(server["id"], a.timeout, a.json)
+    if a.json:
+        return out_json(server)
+    table([server_row(server)], SERVER_HEADER)
+    if generated:
+        print(f"\nroot password (shown once, keep it): {password}")
+    if server.get("ip"):
+        print(f"connect: neckrez ssh {server['id'][:8]}")
+
+
+def cmd_action(name):
+    def run(a):
+        s = find_server(a.server)
+        res = request("POST", f"/api/v1/servers/{s['id']}/{name}")[1]
+        if a.wait:
+            res = wait_running(s["id"], a.timeout, a.json)
+        out_json(res) if a.json else table([server_row(res)], SERVER_HEADER)
+    return run
+
+
+def cmd_rm(a):
+    s = find_server(a.server)
+    if not a.yes:
+        if not sys.stdin.isatty():
+            raise CliError("refusing to delete without --yes when not on a terminal", 2)
+        if input(f"delete {s['name']} ({s['id'][:8]}, {s.get('ip') or 'no ip'})? Its disk is gone; billing stops. [y/N] ").strip().lower() != "y":
+            print("kept")
+            return
+    request("DELETE", f"/api/v1/servers/{s['id']}")
+    print(f"deleted {s['name']}")
+
+
+def cmd_ssh(a):
+    s = find_server(a.server)
+    if not s.get("ip"):
+        raise CliError(f"{s['name']} has no IP yet (status {s.get('status')})", 1)
+    user = a.user or s.get("login") or "root"
+    cmd = ["ssh", f"{user}@{s['ip']}"] + [x for x in a.ssh_args if x != "--"]
+    os.execvp("ssh", cmd)
+
+
+def backup_row(b):
+    return [b["id"][:8], b.get("label", ""), b.get("status", ""), b.get("plan_id", ""), b.get("location", ""),
+            time.strftime("%Y-%m-%d", time.localtime(b.get("expires_at", 0))) if b.get("expires_at") else "-"]
+
+
+BACKUP_HEADER = ["ID", "LABEL", "STATUS", "PLAN", "LOC", "EXPIRES"]
+
+
+def find_backup(ref):
+    items = get("/api/v1/backups")["backups"]
+    hits = [b for b in items if b["id"] == ref] or [b for b in items if b["id"].startswith(ref)]
+    if len(hits) != 1:
+        raise CliError(f"{'no' if not hits else 'several'} backups match {ref!r}", 1)
+    return hits[0]
+
+
+def cmd_backups(a):
+    if a.action == "ls":
+        items = get("/api/v1/backups")["backups"]
+        return out_json(items) if a.json else table([backup_row(b) for b in items], BACKUP_HEADER)
+    if a.action == "create":
+        if not a.ref:
+            raise CliError("backups create SERVER [--label NAME]", 2)
+        s = find_server(a.ref)
+        b = request("POST", "/api/v1/backups", {"server_id": s["id"], "label": a.label or ""})[1]
+        return out_json(b) if a.json else (table([backup_row(b)], BACKUP_HEADER) or print("kept 7 days; status goes pending -> available in a few minutes"))
+    if not a.ref:
+        raise CliError(f"backups {a.action} BACKUP_ID", 2)
+    b = find_backup(a.ref)
+    if a.action == "restore":
+        s = request("POST", f"/api/v1/backups/{b['id']}/restore")[1]
+        out_json(s) if a.json else (table([server_row(s)], SERVER_HEADER) or print("a NEW server with a new IP"))
+    elif a.action == "rm":
+        request("DELETE", f"/api/v1/backups/{b['id']}")
+        print("deleted")
+
+
+# ── parser ───────────────────────────────────────────────────────────────────
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="machine-readable output")
+    wait = argparse.ArgumentParser(add_help=False)
+    wait.add_argument("--wait", action="store_true", help="wait until the server is running and its SSH (RDP on Windows) port is open")
+    wait.add_argument("--no-port-wait", action="store_true", help="with --wait, stop at status running and do not wait for the SSH/RDP port")
+    wait.add_argument("--timeout", type=int, default=300, help="seconds to wait with --wait (default 300; bare metal needs ~1800)")
+
+    p = argparse.ArgumentParser(prog="neckrez", description="Neckrez command-line client. Docs: https://neckrez.tech/docs")
+    p.add_argument("--version", action="version", version=f"neckrez {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    def add(name, fn, help, parents=(common,)):
+        sp = sub.add_parser(name, help=help, parents=list(parents))
+        sp.set_defaults(fn=fn)
+        return sp
+
+    sp = add("login", cmd_login, "save an API key")
+    sp.add_argument("--key", help="the key (otherwise asked for, hidden)")
+    sp.add_argument("--url", help="API base URL, default " + DEFAULT_URL)
+    add("logout", cmd_logout, "forget the saved key")
+    add("balance", cmd_balance, "balance and recent transactions")
+
+    sp = add("plans", cmd_plans, "list plans with live prices")
+    sp.add_argument("--type", choices=["vps", "dedicated", "gpu", "metal"], help="product line")
+    sp.add_argument("--provider", choices=["vultr", "digitalocean", "linode", "hetzner"])
+    sp.add_argument("--max-price", type=float, help="monthly price ceiling in USD")
+    sp.add_argument("--available", action="store_true", help="only plans that can be ordered now")
+    sp = add("locations", cmd_locations, "list locations")
+    sp.add_argument("--provider", choices=["vultr", "digitalocean", "linode", "hetzner"])
+    sp = add("os", cmd_os, "list operating systems and versions")
+    sp.add_argument("name", nargs="?", help="only this OS id, e.g. ubuntu")
+    sp.add_argument("--provider", choices=["vultr", "digitalocean", "linode", "hetzner"])
+
+    add("ls", cmd_ls, "list your servers")
+    sp = add("show", cmd_show, "full details of one server")
+    sp.add_argument("server")
+
+    sp = add("deploy", cmd_deploy, "create a server (or several with --count)", (common, wait))
+    sp.add_argument("name", help="1-60 chars: letters, digits . _ -")
+    sp.add_argument("--plan", required=True, help="plan id, see `neckrez plans`")
+    sp.add_argument("--location", required=True, help="location code, e.g. AMS; see `neckrez locations`")
+    sp.add_argument("--provider", default="vultr", choices=["vultr", "digitalocean", "linode", "hetzner"])
+    sp.add_argument("--os", default="ubuntu", help="OS id (default ubuntu)")
+    sp.add_argument("--os-version", default="", help='e.g. "24.04"; default is the newest')
+    sp.add_argument("--app", help="one-click app id, e.g. docker, wireguard")
+    sp.add_argument("--password", help="root password (default: a random one, printed once)")
+    sp.add_argument("--ssh-key", nargs="?", const="auto", metavar="FILE|KEY",
+                    help="install an SSH public key; without a value uses ~/.ssh/id_ed25519.pub")
+    sp.add_argument("--backups", action="store_true", help="automatic backups add-on (Vultr only)")
+    sp.add_argument("--ddos", action="store_true", help="DDoS protection add-on (Vultr only)")
+    sp.add_argument("--cloud-init", metavar="FILE", help="cloud-init user data file")
+    sp.add_argument("--count", type=int, default=1, help="deploy N copies, max 10 (NAME-1, NAME-2, ...)")
+
+    for name, helptext in (("start", "power on"), ("stop", "power off (still billed while it exists)"),
+                           ("reboot", "reboot"), ("swap-ip", "give the server a different public IPv4 (slow)")):
+        sp = add(name, cmd_action(name), helptext, (common, wait))
+        sp.add_argument("server")
+    sp = add("rm", cmd_rm, "delete a server; billing stops")
+    sp.add_argument("server")
+    sp.add_argument("-y", "--yes", action="store_true", help="do not ask")
+
+    sp = add("ssh", cmd_ssh, "open an SSH session")
+    sp.add_argument("server")
+    sp.add_argument("-l", "--user", help="login user (default: the server's)")
+    sp.add_argument("ssh_args", nargs=argparse.REMAINDER, help="extra arguments for ssh, after --")
+
+    sp = add("backups", cmd_backups, "snapshots kept 7 days: ls, create, restore, rm")
+    sp.add_argument("action", choices=["ls", "create", "restore", "rm"])
+    sp.add_argument("ref", nargs="?", help="SERVER for create, BACKUP_ID for restore and rm")
+    sp.add_argument("--label", help="label for create")
+    return p
+
+
+def main(argv=None):
+    global PORT_WAIT
+    args = build_parser().parse_args(argv)
+    PORT_WAIT = not getattr(args, "no_port_wait", False)
+    if args.cmd in ("start", "stop", "reboot", "swap-ip") and not hasattr(args, "wait"):
+        args.wait = False
+    try:
+        args.fn(args)
+    except CliError as e:
+        print(f"neckrez: {e}", file=sys.stderr)
+        return e.code
+    except KeyboardInterrupt:
+        return 130
+    except BrokenPipeError:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
