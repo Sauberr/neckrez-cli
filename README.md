@@ -1,5 +1,7 @@
 # neckrez-cli
 
+[![tests](https://github.com/Sauberr/neckrez-cli/actions/workflows/test.yml/badge.svg)](https://github.com/Sauberr/neckrez-cli/actions/workflows/test.yml)
+
 Command-line client for [Neckrez](https://neckrez.tech): rent a VPS, dedicated CPU, NVIDIA GPU or bare metal server, pay with crypto, and manage it from your terminal.
 
 - One file, Python 3.8+, standard library only. Nothing to `pip install`.
@@ -81,6 +83,16 @@ neckrez plans --type gpu --available
 - API docs: https://neckrez.tech/docs
 - Terms: https://neckrez.tech/legal/terms
 - Support: support@neckrez.tech
+
+## Development
+
+The tests run offline, with no API key and no network:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
