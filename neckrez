@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""neckrez: command-line client for the Neckrez public API (https://neckrez.tech/docs).
+"""neckrez: command-line client for the Neckrez public API (https://neckrez.tech/docs/api).
 
 One file, Python 3.8+, standard library only.
 
@@ -461,7 +461,7 @@ def build_parser():
     wait.add_argument("--no-port-wait", action="store_true", help="with --wait, stop at status running and do not wait for the SSH/RDP port")
     wait.add_argument("--timeout", type=int, default=300, help="seconds to wait with --wait (default 300; bare metal needs ~1800)")
 
-    p = argparse.ArgumentParser(prog="neckrez", description="Neckrez command-line client. Docs: https://neckrez.tech/docs")
+    p = argparse.ArgumentParser(prog="neckrez", description="Neckrez command-line client. Docs: https://neckrez.tech/docs/api")
     p.add_argument("--version", action="version", version=f"neckrez {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
 

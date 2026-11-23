@@ -5,7 +5,7 @@
 Command-line client for [Neckrez](https://neckrez.tech): rent a VPS, dedicated CPU, NVIDIA GPU or bare metal server, pay with crypto, and manage it from your terminal.
 
 - One file, Python 3.8+, standard library only. Nothing to `pip install`.
-- Works with the public [Neckrez REST API](https://neckrez.tech/docs).
+- Works with the public [Neckrez REST API](https://neckrez.tech/docs/api).
 - Servers run on Vultr, DigitalOcean, Linode and Hetzner, billed by the hour from one prepaid balance.
 
 ## Install
@@ -80,7 +80,7 @@ neckrez plans --type gpu --available
 [Neckrez](https://neckrez.tech) is a crypto-paid cloud host. Sign-up needs only an email, payment is in Bitcoin, USDT, Monero and 300+ other coins, and servers are billed by the hour with a monthly cap. It is a reseller: the machines run on Vultr, DigitalOcean, Linode and Hetzner.
 
 - Website: https://neckrez.tech
-- API docs: https://neckrez.tech/docs
+- API docs: https://neckrez.tech/docs/api
 - Terms: https://neckrez.tech/legal/terms
 - Support: support@neckrez.tech
 
