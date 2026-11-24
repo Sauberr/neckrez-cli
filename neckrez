@@ -31,7 +31,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 DEFAULT_URL = "https://neckrez.tech"
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "neckrez", "config.json")
 
@@ -290,6 +290,54 @@ def cmd_balance(a):
               ["WHEN", "TYPE", "AMOUNT", "NOTE"])
 
 
+def _deposit_lines(d):
+    print(f"deposit:  {d['id']}  ({d['status']})")
+    print(f"credit:   {money(d['amount_usd'])}" + (f"  (you pay {money(d['total_usd'])} incl. VAT)" if d.get("vat_usd") else ""))
+    if d.get("status") == "pending" and d.get("address"):
+        print(f"send:     {d.get('pay_amount')} {d.get('coin') or d.get('currency', '').upper()} on {d.get('network')}")
+        print(f"to:       {d['address']}")
+        if d.get("expires_at"):
+            print(f"before:   {time.strftime('%Y-%m-%d %H:%M', time.localtime(d['expires_at']))}")
+
+
+def cmd_topup(a):
+    if a.coins:
+        data = get("/api/v1/billing/currencies" + (f"?currency={a.currency}" if a.currency else ""))
+        if a.json:
+            return out_json(data)
+        if data.get("currency"):
+            print(f"minimum for {data['currency']['id']}: ${data['currency']['min_usd']}")
+            return
+        print(f"minimum: ${data['min_usd']}  VAT: {data['vat_pct']}%")
+        table([[c["id"], c["ticker"], c["network"], "yes" if c.get("stablecoin") else ""] for c in data["currencies"]],
+              ["ID", "COIN", "NETWORK", "STABLE"])
+        return
+    if a.status:
+        res = get(f"/api/v1/billing/deposits/{a.status}")
+        if a.json:
+            return out_json(res)
+        _deposit_lines(res["deposit"])
+        print(f"balance:  {money(res['balance'])}")
+        return
+    if not a.amount or not a.currency:
+        raise CliError("usage: neckrez topup AMOUNT_USD --currency ID   (coins: neckrez topup --coins)", 2)
+    res = request("POST", "/api/v1/billing/deposit", {"amount_usd": a.amount, "currency": a.currency})[1]
+    if a.json:
+        return out_json(res)
+    d = res["deposit"]
+    _deposit_lines(d)
+    print("\nThe balance is credited automatically after network confirmation.")
+    print(f"Check: neckrez topup --status {d['id']}")
+
+
+def cmd_deposits(a):
+    rows = get("/api/v1/billing/deposits")["deposits"]
+    if a.json:
+        return out_json(rows)
+    table([[time.strftime("%Y-%m-%d %H:%M", time.localtime(d.get("created_at", 0))), d["id"], d["status"],
+            money(d["amount_usd"]), d.get("currency", "")] for d in rows], ["WHEN", "ID", "STATUS", "AMOUNT", "COIN"])
+
+
 def cmd_plans(a):
     plans = get("/api/meta", auth=False)["plans"]
     plans = [p for p in plans if (not a.provider or p.get("provider") == a.provider)
@@ -475,6 +523,12 @@ def build_parser():
     sp.add_argument("--url", help="API base URL, default " + DEFAULT_URL)
     add("logout", cmd_logout, "forget the saved key")
     add("balance", cmd_balance, "balance and recent transactions")
+    sp = add("topup", cmd_topup, "top up the balance with crypto (address and exact amount)")
+    sp.add_argument("amount", nargs="?", type=float, help="US dollars to credit, e.g. 20")
+    sp.add_argument("--currency", help="coin id, e.g. usdtbsc; see --coins")
+    sp.add_argument("--coins", action="store_true", help="list coins (with --currency: that coin's minimum)")
+    sp.add_argument("--status", metavar="DEPOSIT_ID", help="check a top-up; credited once confirmed")
+    add("deposits", cmd_deposits, "your recent top-ups")
 
     sp = add("plans", cmd_plans, "list plans with live prices")
     sp.add_argument("--type", choices=["vps", "dedicated", "gpu", "metal"], help="product line")

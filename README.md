@@ -39,12 +39,22 @@ neckrez ssh web-1
 neckrez rm web-1                         # billing stops
 ```
 
+Top up without opening the dashboard:
+
+```bash
+neckrez topup --coins                    # coin ids, e.g. usdtbsc, btc
+neckrez topup 20 --currency usdtbsc      # address + exact amount to send
+neckrez topup --status <deposit-id>      # credited once the network confirms
+```
+
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `login` / `logout` | Save or forget the API key |
 | `balance` | Prepaid balance and recent transactions |
+| `topup AMOUNT --currency ID` | Top up with crypto: prints the address and the exact amount; `--coins` lists coins, `--status ID` checks a payment |
+| `deposits` | Your recent top-ups |
 | `plans [--type vps\|dedicated\|gpu\|metal] [--provider P] [--max-price N] [--available]` | Plans with live prices |
 | `locations [--provider P]` | Locations |
 | `os [NAME] [--provider P]` | Operating systems and versions |

@@ -48,7 +48,7 @@ class EntryPoint(unittest.TestCase):
     def test_help_lists_commands(self):
         r = self.run_cli("--help")
         self.assertEqual(r.returncode, 0)
-        for cmd in ("login", "plans", "deploy", "ls", "ssh", "backups"):
+        for cmd in ("login", "plans", "deploy", "ls", "ssh", "backups", "topup", "deposits"):
             self.assertIn(cmd, r.stdout)
 
     def test_no_command_is_an_error(self):
@@ -77,6 +77,19 @@ class Parser(unittest.TestCase):
     def test_deploy_requires_plan_and_location(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.p.parse_args(["deploy", "web-1"])
+
+    def test_topup_options(self):
+        a = self.p.parse_args(["topup", "20", "--currency", "usdtbsc"])
+        self.assertEqual((a.amount, a.currency, a.coins, a.status), (20.0, "usdtbsc", False, None))
+        self.assertTrue(self.p.parse_args(["topup", "--coins"]).coins)
+        self.assertEqual(self.p.parse_args(["topup", "--status", "abc123"]).status, "abc123")
+        self.assertTrue(self.p.parse_args(["deposits", "--json"]).json)
+
+    def test_topup_without_amount_explains_usage(self):
+        a = self.p.parse_args(["topup"])
+        with self.assertRaises(cli.CliError) as ctx:
+            a.fn(a)
+        self.assertIn("--currency", str(ctx.exception))
 
     def test_json_flag_everywhere(self):
         self.assertTrue(self.p.parse_args(["ls", "--json"]).json)

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3 — 2026-11-24
+- `topup AMOUNT --currency ID`: top up the balance with crypto from the terminal (address and exact amount); `topup --coins` lists coins, `topup --status ID` checks a payment.
+- `deposits`: your recent top-ups.
+
 ## 0.1.2 — 2026-11-21
 - `--provider` accepts `linode` in `plans`, `locations`, `os` and `deploy` (Linode is live on Neckrez).
 - Offline unit tests and a GitHub Actions workflow (Python 3.8–3.13, Linux, macOS, Windows).
