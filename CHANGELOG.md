@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.4 — 2026-11-25
+- `reset-password SERVER`: a new root password without a reinstall, through the server's recovery key (`--password` to choose it, `--port` if sshd is not on 22).
+
 ## 0.1.3 — 2026-11-24
 - `topup AMOUNT --currency ID`: top up the balance with crypto from the terminal (address and exact amount); `topup --coins` lists coins, `topup --status ID` checks a payment.
 - `deposits`: your recent top-ups.

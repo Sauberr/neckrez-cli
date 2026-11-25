@@ -91,6 +91,12 @@ class Parser(unittest.TestCase):
             a.fn(a)
         self.assertIn("--currency", str(ctx.exception))
 
+    def test_reset_password_options(self):
+        a = self.p.parse_args(["reset-password", "web-1"])
+        self.assertEqual((a.server, a.password, a.port), ("web-1", None, 22))
+        a = self.p.parse_args(["reset-password", "web-1", "--password", "LongPassword123", "--port", "2222"])
+        self.assertEqual((a.password, a.port), ("LongPassword123", 2222))
+
     def test_json_flag_everywhere(self):
         self.assertTrue(self.p.parse_args(["ls", "--json"]).json)
         self.assertTrue(self.p.parse_args(["balance", "--json"]).json)

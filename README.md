@@ -62,6 +62,7 @@ neckrez topup --status <deposit-id>      # credited once the network confirms
 | `ls` | Your servers |
 | `show SERVER` | Full details of one server |
 | `start` / `stop` / `reboot` / `swap-ip SERVER [--wait]` | Power actions and a new public IPv4 |
+| `reset-password SERVER [--password P] [--port N]` | New root password without a reinstall (the server's recovery key) |
 | `rm SERVER [-y]` | Delete a server |
 | `ssh SERVER [-- ssh args]` | Open an SSH session |
 | `backups ls\|create\|restore\|rm` | Snapshots kept for 7 days |

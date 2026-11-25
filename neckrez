@@ -31,7 +31,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 DEFAULT_URL = "https://neckrez.tech"
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "neckrez", "config.json")
 
@@ -442,6 +442,20 @@ def cmd_action(name):
     return run
 
 
+def cmd_reset_password(a):
+    """A new password without a reinstall, through the server's recovery key."""
+    s = find_server(a.server)
+    body = {"port": a.port}
+    if a.password:
+        body["password"] = a.password
+    res = request("POST", f"/api/v1/servers/{s['id']}/root-password", body)[1]
+    if a.json:
+        return out_json(res)
+    print(f"login:    {res['login']}")
+    print(f"password: {res['password']}")
+    print(f"ssh {res['login']}@{s.get('ip')}" + (f" -p {a.port}" if a.port != 22 else ""))
+
+
 def cmd_rm(a):
     s = find_server(a.server)
     if not a.yes:
@@ -565,6 +579,10 @@ def build_parser():
                            ("reboot", "reboot"), ("swap-ip", "give the server a different public IPv4 (slow)")):
         sp = add(name, cmd_action(name), helptext, (common, wait))
         sp.add_argument("server")
+    sp = add("reset-password", cmd_reset_password, "new root password without a reinstall (recovery key)")
+    sp.add_argument("server")
+    sp.add_argument("--password", help="12-72 chars, no spaces (default: a random one, printed once)")
+    sp.add_argument("--port", type=int, default=22, help="SSH port, if sshd is not on 22")
     sp = add("rm", cmd_rm, "delete a server; billing stops")
     sp.add_argument("server")
     sp.add_argument("-y", "--yes", action="store_true", help="do not ask")
